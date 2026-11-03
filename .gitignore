@@ -11,3 +11,4 @@ __pycache__/
 # Java
 target/
 *.class
+dependency-reduced-pom.xml
