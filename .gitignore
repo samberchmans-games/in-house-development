@@ -1,0 +1,13 @@
+# Generated data files (too large for git - regenerate with generate_claims_data.py)
+data-generator/data/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Java
+target/
+*.class
