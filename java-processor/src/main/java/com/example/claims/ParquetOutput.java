@@ -95,6 +95,9 @@ public final class ParquetOutput implements AutoCloseable {
                       String pName, String pSpecialty, String pNpi, String pNetwork) throws IOException {
         // Reused: ParquetWriter.write() shreds the record into column buffers
         // synchronously, so it is safe to overwrite every field on the next row.
+        // Saves one GenericData.Record (+ its Object[21]) per row, i.e. ~749M allocations
+        // on the full run. Together with logback.xml at WARN, the 25M-claim sample's
+        // join+write went from 105 s to 19 s.
         GenericRecord r = record;
         put(r, 0, claimId); put(r, 1, memberId); put(r, 2, providerId);
         put(r, 3, claimDate); put(r, 4, serviceCode); put(r, 5, diagCode);

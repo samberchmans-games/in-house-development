@@ -17,7 +17,12 @@ import java.util.concurrent.atomic.AtomicLong;
  *    payload. Two tables = 16 GiB of index + ~19 GiB payload = ~35 GiB, which
  *    does not fit a 30 GiB heap (or a 32 GiB machine).
  *  - When ids are dense, the id IS the slot. No keys array, no hashing, no
- *    probing: one long[maxId+1] = 2 GiB per table. Total drops to ~23 GiB.
+ *    probing: one long[maxId+1] = 1.9 GiB per table (measured).
+ *  - Measured, full data: index 16 GiB -> 3.8 GiB for both tables. With text
+ *    payloads the tables were 23.0 GiB (still too big for a 32 GB Mac); with
+ *    {@link Codecs} they are 11.4 GiB, which is what made the 12.6 min run possible.
+ *  - Lookups also got cheaper: one array read instead of hash + linear probe
+ *    over two 4 GiB arrays (two cache misses per probe).
  *  - Ids above maxId (unexpected / sparse outliers) go to a small overflow
  *    map instead of failing, and are reported.
  *

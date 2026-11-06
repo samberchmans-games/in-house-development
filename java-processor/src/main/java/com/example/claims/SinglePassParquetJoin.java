@@ -19,17 +19,53 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Approach 1c - plain Java, SINGLE-PASS parallel join writing Parquet.
  *
- *  1. Single pass: both reference tables held in memory at once, so claims are
- *     read ONCE and the final result written directly (no intermediate files).
- *     Uses {@link DenseIdJoinTable}: ids are dense, so the id is the array slot
- *     (~23 GiB for both tables vs ~35 GiB with the hash-table version, which
- *     could not fit a 30 GiB heap).
- *  2. Reference tables are loaded in parallel (one task per part file).
- *  3. Parquet output: columnar + Snappy, one file per claims chunk. Each part is
- *     written to a .inprogress file and renamed only on success, so a failed
- *     run never leaves a valid-looking truncated part behind.
+ * Reads 800M claims once, looks each up in two in-memory 250M-row reference
+ * tables (members, providers), cleanses, and writes one Parquet file per claims
+ * chunk. Never materializes an intermediate result and uses no temp disk.
  *
- * Usage: singlepass <dataDir> <outDir> [maxId=250000000] [threads=cores-1]
+ * <h2>Measured result (full data, commit 2031232)</h2>
+ * <pre>
+ *   Machine : Apple M1 Max (8P + 2E cores), 32 GB, Java 11.0.20
+ *   Command : java -Xms15g -Xmx15g -XX:+AlwaysPreTouch -XX:+UseG1GC  *               -jar claims-processor-1.0.0.jar singlepass DATA OUT 250000000 9
+ *   Load    : members 35.7 s + providers 37.7 s          =  73.5 s
+ *   Join    : 800,000,032 read -> 748,953,178 written    = 680.2 s (1.18M rows/s)
+ *   Total   : 753.7 s (12.6 min), heap 11.4 GiB, peak RSS 16.8 GB, 0 swaps
+ * </pre>
+ *
+ * <h2>What got it there (each step measured; see SINGLEPASS_FINDINGS.md)</h2>
+ * <pre>
+ *   Change                                          Effect
+ *   ----------------------------------------------  -----------------------------------------
+ *   Original: 2 x OnHeapJoinTable (hash, 2^29 slots) needs ~35 GiB -> cannot fit 30g heap
+ *   1. DenseIdJoinTable (id = array slot)           index 16 GiB -> 3.8 GiB; tables 23 GiB
+ *      but 23 GiB on a 32 GB Mac swaps                join stalled: 0 rows in 9 min
+ *   2. Codecs (dictionary + pattern encoding)       providers 13.7 -> 3.4 GiB; tables 11.4 GiB
+ *      but -Xmx20g lets macOS compress the heap       300K rows/s (15 GB of heap compressed)
+ *   3. -Xms15g -Xmx15g -XX:+AlwaysPreTouch          1.18M rows/s, 7.7 cores busy -> 12.6 min
+ *   4. logback.xml at WARN (was DEBUG by default)   sample join+write 105 s -> 19 s
+ *   5. Parallel reference load (1 task per part)    500M rows loaded in 73.5 s
+ *   6. ParquetOutput reuses one Avro record         no per-row record allocation
+ * </pre>
+ *
+ * <h2>Robustness fixes (no speed change, but they made the problems visible)</h2>
+ * <ul>
+ *   <li>{@link #runAll} cancels the remaining tasks on the first failure, and
+ *       {@code main} calls {@code shutdownNow()} in a {@code finally}. Before, a failed
+ *       chunk left non-daemon pool threads alive and the JVM never exited, so a
+ *       failure looked like a slow run.</li>
+ *   <li>Each part is written to {@code .inprogress} and renamed only on success.
+ *       Before, try-with-resources wrote a valid footer even on failure, so a
+ *       half-written part looked complete.</li>
+ *   <li>A 30 s progress line (rows, written, heap). This is how the swap stall was found.</li>
+ *   <li>Drop-reason counters (malformed / no claim id / bad key / not found).</li>
+ * </ul>
+ *
+ * <h2>Sizing rule</h2>
+ * heap ~= per table (8 B x maxId + encoded payload) + 2-3 GiB working memory.
+ * Keep -Xmx no larger than the RAM the OS will keep resident: a join does random
+ * lookups, so any swapped or compressed page turns into a stall.
+ *
+ * Usage: singlepass &lt;dataDir&gt; &lt;outDir&gt; [maxId=250000000] [threads=cores-1]
  */
 public final class SinglePassParquetJoin {
 
