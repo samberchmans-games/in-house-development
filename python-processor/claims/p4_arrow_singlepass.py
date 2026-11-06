@@ -132,7 +132,7 @@ class NpiColumn:
 
 class _Buf:
     """Append-only NumPy buffer: one big allocation per part instead of a list of
-    ~1,500 per-batch arrays. Keeping those small arrays alive until a final
+    ~900 per-batch arrays (~150 batches x 6). Keeping those small arrays alive until a final
     np.concatenate fragmented the macOS allocator: RSS stayed at 12.6 GiB after
     loading 2.3 GiB of members, and macOS later compressed ~10 GB of it."""
 

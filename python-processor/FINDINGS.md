@@ -58,7 +58,7 @@ So the difference is per-row cost, not parallelism:
 
 - **Python never touches a row.** Every per-row operation (gzip, CSV parsing, trim, upper,
   regex, cast, `take`, Parquet encoding) runs inside Arrow's C++ kernels on ~170K-row
-  batches. Python code runs once per batch, about 4,700 times per claims part.
+  batches. Python code runs once per batch, about 150 times per 25M-row claims part.
 - Java's hot loop allocates per row: `BufferedReader.readLine()` → `String.split(",")` →
   a `String[]` and 12 `String`s → cleansing creates more `String`s → an Avro record →
   parquet-mr. That is a lot of short-lived objects and GC work, even with the record reused.
@@ -164,7 +164,7 @@ than the design intended, so it was traced on the members load alone (2.33 GiB o
 | timeline: after part tasks | 2.0 GiB | as designed |
 | timeline: + dense index + final concatenation | 6.1 GiB | short-lived NumPy temporaries macOS keeps cached after free |
 
-Cause: the loader kept ~1,500 small per-batch NumPy arrays per part alive until a final
+Cause: the loader kept ~900 small per-batch NumPy arrays per part (~150 batches × 6 arrays) alive until a final
 `np.concatenate`. Interleaved with each batch's short-lived temporaries, that fragments the
 macOS allocator's medium-size region, so freed memory can't be handed back. Writing each
 batch straight into one preallocated array per part fixes most of it.
