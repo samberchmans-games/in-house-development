@@ -133,6 +133,10 @@ The full job was run three times on the same input:
 | 1 | as committed | 389.8 s | 341.4 s (2.34M rows/s) | 12.1 GiB | ✅ | — |
 | 2 | same | **322.6 s (5.4 min)** | 274.4 s (2.92M rows/s) | 16.6 GiB | ✅ | **identical** (per-part row-hash checksum, 32/32 parts) |
 | 3 | + loader buffer fix | ~~491.7 s~~ invalid | — | 13.1 GiB | ✅ | **identical** (32/32 parts) |
+| **4** | same as 3, clean: lid open, AC, `caffeinate -dims` | **308.0 s (5.1 min)** | 258.3 s (**3.10M rows/s**) | 15.2 GiB | ✅ | **identical** (32/32 parts) |
+
+Run 4 is the clean reference measurement: wall clock 308.5 s = job time (no sleep), ~7.9
+cores busy, swap unchanged (5.90 → 5.87 GB used), 2,269 s user + 166 s sys CPU.
 
 - **Deterministic:** all three runs wrote the same 748,953,178 rows, part for part, and no
   `.inprogress` files were left behind.
@@ -165,11 +169,25 @@ Cause: the loader kept ~1,500 small per-batch NumPy arrays per part alive until 
 macOS allocator's medium-size region, so freed memory can't be handed back. Writing each
 batch straight into one preallocated array per part fixes most of it.
 
-Effect: sample peak RSS **4.3 → 2.6 GiB**. On the full run (run 3), RSS after load went 10.8 →
-9.3 GiB, but footprint during the join was still 15–17 GB with 5–7 GB compressed. Run 3
-happened during sleep/dark-wake cycles under system memory pressure, so this needs a clean
-re-run before drawing conclusions. The join phase's own working memory (8 threads, each
-buffering up to 1M output rows plus a Parquet row group) hasn't been measured separately yet.
+Effect: sample peak RSS **4.3 → 2.6 GiB**. At full scale the clean run 4 shows the fix is
+only partial:
+
+| Time into run 4 | Phase | Footprint | Compressed |
+|---|---|---|---|
+| 18 s | loading members | 5.0 GB | 0 |
+| 34 s | loading providers | 10 GB | 2.1 GB |
+| 51 s | end of load (index build + concatenation) | **21 GB** | **14 GB** |
+| 1–5 min | join+write, steady | 13–17 GB | 3–7 GB |
+
+- The **peak is the end of the reference load**, when the dense index is built and the
+  per-part arrays are concatenated. Their temporaries are freed, but macOS keeps the pages
+  and compresses them.
+- During the join, the footprint holds at ~16 GB with ~5 GB compressed. Swap didn't grow,
+  and run 4 was the **fastest run**, so the compressed pages are cold. The tables themselves
+  (6.05 GiB) stay resident.
+- Still to do if memory matters: build the index without per-part temporaries (write the
+  per-part buffers straight into the final column arrays), and measure the join's own working
+  memory (8 threads × up to 1M buffered output rows + a Parquet row group each).
 
 ---
 
