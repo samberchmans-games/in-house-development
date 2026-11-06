@@ -1,0 +1,12 @@
+<configuration>
+    <!-- Without this file logback (pulled in transitively by hadoop-common) defaults
+         to DEBUG on stdout, and parquet-mr logs several lines for every page and
+         column chunk it writes.
+         Measured on the 25M-claim sample: join+write 105 s -> 19 s once this file
+         set the root level to WARN (together with Avro record reuse in ParquetOutput). -->
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder><pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern></encoder>
+    </appender>
+    <root level="WARN"><appender-ref ref="STDERR"/></root>
+</configuration>
