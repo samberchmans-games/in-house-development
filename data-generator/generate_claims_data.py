@@ -106,7 +106,7 @@ WITH src AS (
          DATE '2021-01-01' + (random() * 1826)::INTEGER AS svc_date,
          DATE '1940-01-01' + (random() * 25550)::INTEGER AS dob_date,
          round((20 + random() * 4980)::DECIMAL(10,2), 2) AS amt
-  FROM generate_series({start}, {end}) t(i)
+  FROM range({start}, {end}) t(i)  -- range() is end-exclusive; generate_series() is inclusive
 )
 SELECT
   CASE
@@ -194,7 +194,7 @@ def members_select(start, end):
 WITH src AS (
   SELECT i, random() AS r1, random() AS r2, random() AS r3,
          random() AS r4, random() AS r5, random() AS r6, random() AS r7
-  FROM generate_series({start}, {end}) t(i)
+  FROM range({start}, {end}) t(i)  -- range() is end-exclusive; generate_series() is inclusive
 )
 SELECT
   'MBR' || lpad(i::VARCHAR, 9, '0') AS member_id,
@@ -219,7 +219,7 @@ def providers_select(start, end):
 WITH src AS (
   SELECT i, random() AS r1, random() AS r2, random() AS r3,
          random() AS r4, random() AS r5, random() AS r6
-  FROM generate_series({start}, {end}) t(i)
+  FROM range({start}, {end}) t(i)  -- range() is end-exclusive; generate_series() is inclusive
 )
 SELECT
   'PRV' || lpad(i::VARCHAR, 9, '0') AS provider_id,

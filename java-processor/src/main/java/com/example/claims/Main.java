@@ -27,6 +27,12 @@ public final class Main {
             case "plain":
                 PlainJavaJoin.main(rest);
                 break;
+            case "parallel":
+                ParallelJavaJoin.main(rest);
+                break;
+            case "singlepass":
+                SinglePassParquetJoin.main(rest);
+                break;
             case "duckdb":
                 DuckDbJoin.main(rest);
                 break;
