@@ -124,6 +124,53 @@ That's ~1.5 GB of Arrow strings per part, times 8 threads. On the 2-part sample:
 | `read_csv` whole part, then encode | 8.2 GiB | 24.0 s |
 | `open_csv` stream, encode each 16 MB batch | **5.7 GiB** | **17.6 s** |
 
+### Re-runs: is it repeatable?
+
+The full job was run three times on the same input:
+
+| Run | Code | Job time | Join+write | Peak RSS | Counters = Java | Output vs run 1 |
+|---|---|---|---|---|---|---|
+| 1 | as committed | 389.8 s | 341.4 s (2.34M rows/s) | 12.1 GiB | ✅ | — |
+| 2 | same | **322.6 s (5.4 min)** | 274.4 s (2.92M rows/s) | 16.6 GiB | ✅ | **identical** (per-part row-hash checksum, 32/32 parts) |
+| 3 | + loader buffer fix | ~~491.7 s~~ invalid | — | 13.1 GiB | ✅ | **identical** (32/32 parts) |
+
+- **Deterministic:** all three runs wrote the same 748,953,178 rows, part for part, and no
+  `.inprogress` files were left behind.
+- **Run-to-run timing varies ~20%** (5.4–6.5 min) on a laptop that is also running other
+  apps. The swap file was already 6.7–7.9 GB full before each run started.
+- **Run 3's timing is invalid: the Mac went to sleep twice during it** (13:04–13:19 and
+  13:24–13:39 in `pmset -g log`; the second was a *"Dark Wake Thermal Emergency"*).
+  Python's `perf_counter` doesn't advance during sleep, so the job reported 491.7 s while the
+  process took 45 minutes of wall-clock time. The harness now also measures wall-clock time
+  and prints a warning when they differ. Benchmark runs need the lid open on AC power, with
+  `caffeinate -dims` keeping the machine awake.
+
+### Memory: what macOS actually saw
+
+Run 2 sampled the macOS process footprint (`top` MEM / CMPRS) correctly for the first time:
+**~20 GB footprint with 10–11 GB of it compressed**, from the end of the load onward,
+although the tables are only 6.05 GiB. Throughput didn't suffer (run 2 was the fastest),
+so the compressed pages were memory nobody touched again, not the tables. It is still more
+than the design intended, so it was traced on the members load alone (2.33 GiB of real data):
+
+| Step (members only) | RSS | Note |
+|---|---|---|
+| original loader | **12.6 GiB** | Arrow pool holds 0 bytes; swapping Arrow's allocator to the system allocator: still 10.7 GiB |
+| + one preallocated buffer per part (`_Buf`) | **8.8 GiB** | compressed 1.3 MB instead of GBs |
+| timeline: after part tasks | 2.0 GiB | as designed |
+| timeline: + dense index + final concatenation | 6.1 GiB | short-lived NumPy temporaries macOS keeps cached after free |
+
+Cause: the loader kept ~1,500 small per-batch NumPy arrays per part alive until a final
+`np.concatenate`. Interleaved with each batch's short-lived temporaries, that fragments the
+macOS allocator's medium-size region, so freed memory can't be handed back. Writing each
+batch straight into one preallocated array per part fixes most of it.
+
+Effect: sample peak RSS **4.3 → 2.6 GiB**. On the full run (run 3), RSS after load went 10.8 →
+9.3 GiB, but footprint during the join was still 15–17 GB with 5–7 GB compressed. Run 3
+happened during sleep/dark-wake cycles under system memory pressure, so this needs a clean
+re-run before drawing conclusions. The join phase's own working memory (8 threads, each
+buffering up to 1M output rows plus a Parquet row group) hasn't been measured separately yet.
+
 ---
 
 ## 3. Bug #6: Java's CSV split mis-reads 4% of claims (found by the parity check)
@@ -156,10 +203,13 @@ row by row and puts every differing row into one of two classes:
 |---|---|---|---|---|
 | sample 1 (1 part) | 234,688 | 9,386 (4.0%) | 9,386 | **0** |
 | sample 2 (2 parts) | 1,871,401 | 75,112 (4.0%) | 75,112 | **0** |
-| full (32 parts) | 748,953,178 | _pending_ | _pending_ | _pending_ |
+| full (32 parts) | 748,953,178 | 30,081,528 (4.0%) | 30,081,528 | **0** |
+
+The full check compared each Java part file with the matching Python part file
+(`python -m claims verify <java-out> <py-out> <data>`, 18 min). All 32 parts: 0 unexplained.
 
 So the Python output is the correct one for those rows, and the Java full output has
-roughly 30M rows with shifted amounts, status, state, DOB and source system. This adds to
+**30,081,528 rows** with shifted amounts, status, state, DOB and source system. This adds to
 BLOG_NOTES §20: the Java numbers for `billed_amount = null` etc. are inflated by these rows.
 
 > Lesson: "the row counts match" is not verification. A column-level diff found what three

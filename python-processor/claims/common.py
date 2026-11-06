@@ -85,7 +85,7 @@ class Run:
 
     def __init__(self, tag, every=30.0):
         self.tag, self.stats, self.phase = tag, Stats(), "starting"
-        self.t0 = time.perf_counter()
+        self.t0, self.wall0 = time.perf_counter(), time.time()
         self.times = {}
         self._stop = threading.Event()
         self._every = every
@@ -129,5 +129,11 @@ class Run:
         cpu = os.times()
         self.log(f"cpu: user={cpu.user:.0f} s sys={cpu.system:.0f} s  "
                  f"(~{(cpu.user + cpu.system) / total:.1f} cores busy)  peak rss={peak_rss_gib():.1f} GiB")
+        # perf_counter stops while macOS sleeps; the wall clock does not. A gap means the
+        # machine slept (or was suspended) mid-run, so the timings are not a clean benchmark.
+        wall = time.time() - self.wall0
+        if wall > total * 1.05 + 5:
+            self.log(f"WARNING: wall clock {wall:.0f} s vs job time {total:.0f} s: the machine slept "
+                     f"for ~{wall - total:.0f} s during the run; do not use these timings")
         for k, v in (extra or {}).items():
             self.log(f"{k}: {v}")

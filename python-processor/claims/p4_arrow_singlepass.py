@@ -130,6 +130,29 @@ class NpiColumn:
 
 # ---------------------------------------------------------------- reference table
 
+class _Buf:
+    """Append-only NumPy buffer: one big allocation per part instead of a list of
+    ~1,500 per-batch arrays. Keeping those small arrays alive until a final
+    np.concatenate fragmented the macOS allocator: RSS stayed at 12.6 GiB after
+    loading 2.3 GiB of members, and macOS later compressed ~10 GB of it."""
+
+    def __init__(self, dtype, capacity=1 << 25):     # 33.5M rows: a 25M-row part never grows
+        self.a, self.n = np.empty(capacity, dtype), 0  # untouched pages are never resident
+
+    def append(self, x):
+        need = self.n + len(x)
+        if need > len(self.a):
+            grown = np.empty(max(need, len(self.a) * 3 // 2), self.a.dtype)
+            grown[:self.n] = self.a[:self.n]
+            self.a = grown
+        self.a[self.n:need] = x
+        self.n = need
+
+    def array(self):
+        return self.a[:self.n]
+
+
+
 class RefTable:
     def __init__(self, name, key_col, columns):
         self.name, self.key_col, self.columns = name, key_col, columns   # {out_name: encoder}
@@ -143,13 +166,15 @@ class RefTable:
             # strings is ~1.5 GB, times 8 threads; the encoded batches are a few MB.
             reader = pcsv.open_csv(paths[i], read_options=pcsv.ReadOptions(block_size=BLOCK_SIZE),
                                    convert_options=_convert(srcs))
-            keys, cols = [], {n: [] for n in self.columns}
+            keys, cols = _Buf(np.int64), {n: None for n in self.columns}
             for b in reader:
                 keys.append(c.a_parse_id(b.column(self.key_col)).fill_null(-1).to_numpy())
                 for n, e in self.columns.items():
-                    cols[n].append(e.encode(b.column(e.src)))
+                    codes = e.encode(b.column(e.src))
+                    cols[n] = cols[n] or _Buf(codes.dtype)
+                    cols[n].append(codes)
                 run.stats.add(loaded=b.num_rows)
-            results[i] = (np.concatenate(keys), {n: np.concatenate(v) for n, v in cols.items()})
+            results[i] = (keys.array(), {n: v.array() for n, v in cols.items()})
 
         _run_all(threads, [lambda i=i: task(i) for i in range(len(paths))])
         pa.default_memory_pool().release_unused()
