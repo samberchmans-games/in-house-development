@@ -113,12 +113,12 @@ def test_output_matches_hand_written_expectation(tiny, tmp_path):
 
 def test_output_schema(tiny, tmp_path):
     singlepass.main(tiny, tmp_path / "out", threads=1, as_of=AS_OF, capacity=16, quiet=True)
-    schema = pq.read_schema(tmp_path / "out" / "part-00000.parquet")
+    schema = pq.read_schema(tmp_path / "out" / "part-00000-000.parquet")
     assert schema.names == OUTPUT_COLUMNS
     assert str(schema.field("claim_date").type) == "date32[day]"
     assert str(schema.field("flag_negative_billed").type) == "bool"
     # the part rewritten by the cross-part dedupe keeps the same schema
-    assert pq.read_schema(tmp_path / "out" / "part-00001.parquet") == schema
+    assert pq.read_schema(tmp_path / "out" / "part-00001-000.parquet") == schema
 
 
 def test_reference_sql_agrees_on_tiny_data(tiny, tmp_path):
@@ -139,10 +139,24 @@ def test_failed_part_leaves_no_partial_files(tmp_path):
     with pytest.raises(Exception):
         singlepass.main(data, tmp_path / "out", threads=2, as_of=AS_OF, capacity=16, quiet=True)
     assert not list((tmp_path / "out").glob("*.inprogress"))
-    assert not (tmp_path / "out" / "part-00001.parquet").exists()
+    assert not list((tmp_path / "out").glob("part-00001-*"))
 
 
 def test_refuses_to_overwrite_previous_output(tiny, tmp_path):
     singlepass.main(tiny, tmp_path / "out", threads=1, as_of=AS_OF, capacity=16, quiet=True)
     with pytest.raises(SystemExit, match="already has part files"):
         singlepass.main(tiny, tmp_path / "out", threads=1, as_of=AS_OF, capacity=16, quiet=True)
+
+
+def test_many_small_files_and_targeted_cross_part_rewrite(tiny, tmp_path, monkeypatch, capsys):
+    # tiny batches and one row per file: rotation, per-file key ranges, and the cross-part
+    # dedup must rewrite only the file holding the duplicate (CLM00000000008 in part 1)
+    monkeypatch.setattr(singlepass, "BLOCK_SIZE", 256)
+    monkeypatch.setattr(singlepass, "ROW_GROUP_ROWS", 1)
+    monkeypatch.setattr(singlepass, "FILE_ROWS", 1)
+    stats = singlepass.main(tiny, tmp_path / "out", threads=2, as_of=AS_OF, capacity=16)
+    assert _rows(tmp_path / "out") == EXPECTED
+    assert stats.duplicate_claim_id == 2
+    files = sorted(p.name for p in (tmp_path / "out").glob("*.parquet"))
+    assert len(files) >= 5 and files[0] == "part-00000-000.parquet"
+    assert "1 duplicate ids, 1 rows removed, 1 files rewritten" in capsys.readouterr().out

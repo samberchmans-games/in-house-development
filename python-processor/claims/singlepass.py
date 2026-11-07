@@ -41,6 +41,8 @@ from .common import (CLAIM_COLS, CLAIMS, GIB, MEMBERS, OUTPUT_FIELDS, PROVIDERS,
 
 BLOCK_SIZE = 16 << 20          # decompressed CSV bytes per Arrow batch (~150K rows)
 ROW_GROUP_ROWS = 1_000_000     # output rows buffered per Parquet row group
+FILE_ROWS = 4_000_000          # output rows per Parquet file (~200 MB): small enough to rewrite
+CSV_THREADS = True             # let Arrow parse each claims part with its own threads too
 PART_CAPACITY = 1 << 25        # max rows per reference part (33.5M; parts here are 25M)
 NULL_CODE = -1
 RISK_NULL = 0xFFFF
@@ -232,6 +234,11 @@ def providers_table(capacity=PART_CAPACITY):
 
 # ---------------------------------------------------------------- de-duplication
 
+def claim_keys(cid):
+    """Numeric part of canonical claim ids (CLM + 11 digits); -1 for anything else."""
+    return _np(pc.cast(pc.struct_field(pc.extract_regex(cid, CLAIM_KEY_RE), [0]), pa.int64()), -1)
+
+
 class SeenClaims:
     """Claim ids one part has written. Canonical ids (CLM + 11 digits) go in a sparse
     bitmap of 1M-id blocks; anything else in a set (none in this data)."""
@@ -243,11 +250,15 @@ class SeenClaims:
 
     def keep_first(self, cid):
         """Marks and returns rows that are the first occurrence of their claim id."""
+        return self.keep_first_keys(cid)[0]
+
+    def keep_first_keys(self, cid):
+        """(keep mask, numeric claim keys with -1 for non-canonical ids)."""
         n = len(cid)
         keep = np.zeros(n, bool)
         if n == 0:
-            return keep
-        num = _np(pc.cast(pc.struct_field(pc.extract_regex(cid, CLAIM_KEY_RE), [0]), pa.int64()), -1)
+            return keep, np.empty(0, np.int64)
+        num = claim_keys(cid)
         canon = num >= 0
         idx = np.flatnonzero(canon)
         if len(idx):
@@ -268,7 +279,7 @@ class SeenClaims:
             if s not in self.other:
                 self.other.add(s)
                 keep[i] = True
-        return keep
+        return keep, num
 
     def packed(self):
         return {b: np.packbits(v) for b, v in self.blocks.items()}, self.other
@@ -295,17 +306,16 @@ def cross_part_duplicates(seen_by_part):
 
 
 def remove_claims(path, ids, strs, schema):
-    """Rewrites one output part without the given claim ids. Returns rows removed."""
+    """Rewrites one output file without the given claim ids. Returns rows removed."""
     tmp = path.with_name(path.name + ".inprogress")
     removed = 0
-    pf = pq.ParquetFile(path)
+    other = pa.array(sorted(strs), pa.string())
     with pq.ParquetWriter(tmp, schema, compression="snappy") as w:
-        for b in pf.iter_batches(batch_size=ROW_GROUP_ROWS):
+        for b in pq.ParquetFile(path).iter_batches(batch_size=ROW_GROUP_ROWS):
             cid = b.column("claim_id")
-            num = _np(pc.cast(pc.struct_field(pc.extract_regex(cid, CLAIM_KEY_RE), [0]), pa.int64()), -1)
-            drop = np.isin(num, ids) | _np(pc.is_in(cid, value_set=pa.array(sorted(strs), pa.string())), False)
+            drop = np.isin(claim_keys(cid), ids) | _np(pc.is_in(cid, value_set=other), False)
             removed += int(drop.sum())
-            w.write_table(pa.Table.from_batches([b.filter(pa.array(~drop))], schema=schema))
+            w.write_table(pa.Table.from_batches([b.filter(pa.array(~drop))]).cast(schema))
     os.replace(tmp, path)
     return removed
 
@@ -318,6 +328,7 @@ def output_schema(members, providers):
 
 
 def join_batch(b, members, providers, seen, schema, stats, as_of):
+    """Returns (output batch or None, its numeric claim keys)."""
     cid, mid, pid = c.ident(b.column(0)), c.ident(b.column(1)), c.ident(b.column(2))
     has_claim = _np(pc.is_valid(cid), False)
     mk, pk = _np(c.parse_id(mid), -1), _np(c.parse_id(pid), -1)
@@ -325,7 +336,7 @@ def join_batch(b, members, providers, seen, schema, stats, as_of):
     mrow, prow = members.lookup(mk), providers.lookup(pk)
     has_member = good_key & (mrow >= 0)
     joined = np.flatnonzero(has_member & (prow >= 0))
-    first = seen.keep_first(pc.take(cid, pa.array(joined)))
+    first, keys = seen.keep_first_keys(pc.take(cid, pa.array(joined)))
     sel = joined[first]
     n, written = len(b), len(sel)
     stats.add(read=n, written=written,
@@ -335,7 +346,7 @@ def join_batch(b, members, providers, seen, schema, stats, as_of):
               provider_not_found=np.count_nonzero(has_member) - len(joined),
               duplicate_claim_id=len(joined) - written)
     if not written:
-        return None
+        return None, keys[first]
     idx = pa.array(sel)
     col = lambda i: pc.take(b.column(i), idx)
     claim_date = c.date(col(3))
@@ -349,10 +360,57 @@ def join_batch(b, members, providers, seen, schema, stats, as_of):
         *(e.take(pr) for e in providers.columns.values()),
         c.flag_negative(billed), c.flag_paid_exceeds(paid, billed),
     ]
-    return pa.RecordBatch.from_arrays(arrays, schema=schema)
+    return pa.RecordBatch.from_arrays(arrays, schema=schema), keys[first]
 
 
-def process_part(run, path, out_path, members, providers, schema, as_of, abort):
+class PartWriter:
+    """Writes one claims part as files of ~FILE_ROWS rows (part-00000-000.parquet, ...).
+
+    Each file records the range of claim keys in it, so the cross-part dedup can find
+    the one file that holds a duplicate. Files are written as .inprogress and only
+    renamed when the whole part succeeded."""
+
+    def __init__(self, out_dir, stem, schema):
+        self.out_dir, self.stem, self.schema = out_dir, stem, schema
+        self.files, self._w, self._rows = [], None, 0     # files: [path, min_key, max_key, has_other]
+
+    def write(self, table, keys):
+        if self._w is None:
+            path = self.out_dir / f"{self.stem}-{len(self.files):03d}.parquet"
+            self.files.append([path, np.iinfo(np.int64).max, -1, False])
+            self._w = pq.ParquetWriter(self._tmp(path), self.schema, compression="snappy")
+        self._w.write_table(table)
+        f = self.files[-1]
+        canon = keys[keys >= 0]
+        if len(canon):
+            f[1], f[2] = min(f[1], int(canon.min())), max(f[2], int(canon.max()))
+        f[3] = f[3] or bool((keys < 0).any())
+        self._rows += table.num_rows
+        if self._rows >= FILE_ROWS:
+            self._close()
+
+    def _tmp(self, path):
+        return path.with_name(path.name + ".inprogress")
+
+    def _close(self):
+        if self._w is not None:
+            self._w.close()
+            self._w, self._rows = None, 0
+
+    def commit(self):
+        self._close()
+        for f in self.files:
+            os.replace(self._tmp(f[0]), f[0])
+
+    def abort(self):
+        try:
+            self._close()
+        finally:
+            for f in self.files:
+                self._tmp(f[0]).unlink(missing_ok=True)
+
+
+def process_part(run, path, out_dir, members, providers, schema, as_of, abort):
     malformed = []
 
     def on_invalid(row):
@@ -360,37 +418,36 @@ def process_part(run, path, out_path, members, providers, schema, as_of, abort):
         return "skip"
 
     reader = pcsv.open_csv(
-        path, read_options=pcsv.ReadOptions(block_size=BLOCK_SIZE),
+        path, read_options=pcsv.ReadOptions(block_size=BLOCK_SIZE, use_threads=CSV_THREADS),
         parse_options=pcsv.ParseOptions(invalid_row_handler=on_invalid),
         convert_options=_convert(CLAIM_COLS))
     if reader.schema.names != CLAIM_COLS:
         raise ValueError(f"{path}: unexpected header {reader.schema.names}")
     seen = SeenClaims()
-    tmp = out_path.with_name(out_path.name + ".inprogress")
+    out = PartWriter(out_dir, path.name.replace(".csv.gz", ""), schema)
     ok = False
     try:
-        with pq.ParquetWriter(tmp, schema, compression="snappy") as w:
-            pending, rows = [], 0
-            for batch in reader:
-                if abort.is_set():
-                    raise RuntimeError("aborted: another part failed")
-                out = join_batch(batch, members, providers, seen, schema, run.stats, as_of)
-                if out is not None:
-                    pending.append(out)
-                    rows += out.num_rows
-                if rows >= ROW_GROUP_ROWS:
-                    w.write_table(pa.Table.from_batches(pending))
-                    pending, rows = [], 0
-            if pending:
-                w.write_table(pa.Table.from_batches(pending))
+        pending, keys, rows = [], [], 0
+        for batch in reader:
+            if abort.is_set():
+                raise RuntimeError("aborted: another part failed")
+            b, k = join_batch(batch, members, providers, seen, schema, run.stats, as_of)
+            if b is not None:
+                pending.append(b)
+                keys.append(k)
+                rows += b.num_rows
+            if rows >= ROW_GROUP_ROWS:
+                out.write(pa.Table.from_batches(pending), np.concatenate(keys))
+                pending, keys, rows = [], [], 0
+        if pending:
+            out.write(pa.Table.from_batches(pending), np.concatenate(keys))
+        out.commit()
         ok = True
     finally:
         run.stats.add(read=len(malformed), malformed=len(malformed))
-        if ok:
-            os.replace(tmp, out_path)
-        else:
-            tmp.unlink(missing_ok=True)
-    return seen.packed()
+        if not ok:
+            out.abort()
+    return seen.packed(), out.files
 
 
 def run_all(threads, tasks, abort=None):
@@ -408,6 +465,20 @@ def run_all(threads, tasks, abort=None):
         return [f.result() for f in futures]
 
 
+def fix_cross_part_duplicates(results, schema, threads):
+    """Removes claim ids that a part shares with an earlier part from the later part's
+    files. Returns (duplicate ids found, rows removed, files rewritten)."""
+    dups = cross_part_duplicates([seen for seen, _ in results])
+    jobs = []
+    for i, (ids, strs) in dups.items():
+        for path, lo, hi, has_other in results[i][1]:
+            hit = bool(len(ids)) and bool(np.any((ids >= lo) & (ids <= hi)))
+            if hit or (strs and has_other):
+                jobs.append(lambda path=path, ids=ids, strs=strs: remove_claims(path, ids, strs, schema))
+    removed = sum(run_all(threads, jobs)) if jobs else 0
+    return sum(len(i) + len(s) for i, s in dups.values()), removed, len(jobs)
+
+
 def main(data, out, threads=8, as_of=None, capacity=PART_CAPACITY, quiet=False):
     as_of = as_of or datetime.date.today().isoformat()
     run = Run("claims", quiet=quiet)
@@ -422,19 +493,19 @@ def main(data, out, threads=8, as_of=None, capacity=PART_CAPACITY, quiet=False):
 
     claim_parts = parts(data, CLAIMS)
     schema = output_schema(members, providers)
-    outs = [out / p.name.replace(".csv.gz", ".parquet") for p in claim_parts]
     run.log(f"single-pass join: {len(claim_parts)} claims parts across {threads} threads -> parquet")
     abort = threading.Event()
     with run.time_phase("join+write"):
-        seen = run_all(threads, [
-            (lambda p=p, o=o: process_part(run, p, o, members, providers, schema, as_of, abort))
-            for p, o in zip(claim_parts, outs)], abort)
-    with run.time_phase("cross-part dedupe"):
-        fixes = cross_part_duplicates(seen)
-        for i, (ids, strs) in fixes.items():
-            removed = remove_claims(outs[i], ids, strs, schema)
-            run.stats.add(written=-removed, duplicate_claim_id=removed)
+        results = run_all(threads, [
+            (lambda p=p: process_part(run, p, out, members, providers, schema, as_of, abort))
+            for p in claim_parts], abort)
+    with run.time_phase("cross-part dedup"):
+        n_ids, removed, rewritten = fix_cross_part_duplicates(results, schema, threads)
+        run.stats.add(written=-removed, duplicate_claim_id=removed)
+    n_files = sum(len(files) for _, files in results)
     run.finish({"as-of date for DOB checks": as_of,
-                "cross-part duplicate ids": sum(len(i) + len(s) for i, s in fixes.values()),
+                "output files": n_files,
+                "cross-part dedup": f"{n_ids} duplicate ids, {removed} rows removed, {rewritten} files "
+                                    f"rewritten in {run.times['cross-part dedup']:.1f} s",
                 "rss at end": f"{rss_gib():.1f} GiB"})
     return run.stats
