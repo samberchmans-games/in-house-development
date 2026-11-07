@@ -1,46 +1,38 @@
-"""CLI: python -m claims <approach> <dataDir> <outDir> [options]
+"""CLI.
 
-  pure    P1 pure Python (csv + dicts), single thread
-  duckdb  P2 DuckDB, one SQL statement
-  polars  P3 Polars lazy query on the streaming engine
-  arrow   P4 Arrow + NumPy single pass (the port of Java singlepass)
-  verify  compare two output dirs: python -m claims verify <outA> <outB> [rawClaimsDir]
+  python -m claims run <dataDir> <outDir> [--threads 8] [--as-of YYYY-MM-DD]
+      the single-pass join (see singlepass.py)
+  python -m claims reference <dataDir> <jobOutDir> --as-of YYYY-MM-DD
+      check a job output against the independent DuckDB SQL implementation (samples only)
+  python -m claims verify <outA> <outB>
+      row-level comparison of two outputs (e.g. two runs)
 """
 
 import argparse
-import os
+import sys
 
 
 def main():
     ap = argparse.ArgumentParser(prog="python -m claims", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("approach", choices=["pure", "duckdb", "polars", "arrow", "verify"])
-    ap.add_argument("data")
-    ap.add_argument("out")
-    ap.add_argument("raw", nargs="?", help="verify only: data dir, to explain differences")
+    ap.add_argument("command", choices=["run", "reference", "verify"])
+    ap.add_argument("a", help="run/reference: data dir; verify: first output dir")
+    ap.add_argument("b", help="run: output dir; reference: job output dir; verify: second output dir")
     ap.add_argument("--threads", type=int, default=8)
-    ap.add_argument("--no-intern", action="store_true", help="pure: keep every field as its own str")
-    ap.add_argument("--limit", type=int, default=0, help="pure: read at most N rows per part")
-    ap.add_argument("--memory-limit", default="14GB", help="duckdb")
-    ap.add_argument("--max-temp", default="150GB", help="duckdb: temp-disk cap")
+    ap.add_argument("--as-of", help="date for the 'DOB in the future' rule (default: today)")
     a = ap.parse_args()
 
-    if a.approach == "pure":
-        from .p1_pure_python import main as run
-        run(a.data, a.out, intern=not a.no_intern, limit=a.limit)
-    elif a.approach == "duckdb":
-        from .p2_duckdb import main as run
-        run(a.data, a.out, threads=a.threads, memory_limit=a.memory_limit, max_temp=a.max_temp)
-    elif a.approach == "polars":
-        os.environ["POLARS_MAX_THREADS"] = str(a.threads)   # must be set before polars is imported
-        from .p3_polars import main as run
-        run(a.data, a.out)
-    elif a.approach == "arrow":
-        from .p4_arrow_singlepass import main as run
-        run(a.data, a.out, threads=a.threads)
+    if a.command == "run":
+        from .singlepass import main as run
+        run(a.a, a.b, threads=a.threads, as_of=a.as_of)
+    elif a.command == "reference":
+        if not a.as_of:
+            ap.error("reference needs --as-of (use the same date the job logged)")
+        from .reference import main as ref
+        sys.exit(0 if ref(a.a, a.b, a.as_of) else 1)
     else:
-        from .verify import main as run
-        run(a.data, a.out, a.raw)
+        from .verify import main as verify
+        sys.exit(0 if verify(a.a, a.b) else 1)
 
 
 if __name__ == "__main__":

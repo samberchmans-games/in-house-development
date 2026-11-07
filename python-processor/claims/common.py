@@ -11,27 +11,25 @@ import psutil
 import pyarrow as pa
 
 CLAIMS, MEMBERS, PROVIDERS = "raw_claims", "member_enrichment", "provider_reference"
-CLAIM_COLS = 12
+CLAIM_COLS = ["claim_id", "member_id", "provider_id", "claim_date", "service_code",
+              "diagnosis_code", "billed_amount", "paid_amount", "claim_status", "state",
+              "member_dob", "source_system"]
 
-# Same 21 columns, names and types as java-processor ParquetOutput.SCHEMA.
+# 23 output columns: the claim, member and provider attributes, plus two data-quality flags.
 OUTPUT_FIELDS = [
     ("claim_id", pa.string()), ("member_id", pa.string()), ("provider_id", pa.string()),
-    ("claim_date", pa.string()), ("service_code", pa.string()), ("diagnosis_code", pa.string()),
+    ("claim_date", pa.date32()), ("service_code", pa.string()), ("diagnosis_code", pa.string()),
     ("billed_amount", pa.float64()), ("paid_amount", pa.float64()),
-    ("claim_status", pa.string()), ("state", pa.string()), ("member_dob", pa.string()),
+    ("claim_status", pa.string()), ("state", pa.string()), ("member_dob", pa.date32()),
     ("source_system", pa.string()),
     ("member_first_name", pa.string()), ("member_last_name", pa.string()),
     ("member_gender", pa.string()), ("member_plan_type", pa.string()),
     ("member_risk_score", pa.float64()),
     ("provider_name", pa.string()), ("provider_specialty", pa.string()),
     ("provider_npi", pa.string()), ("provider_network_status", pa.string()),
+    ("flag_negative_billed", pa.bool_()), ("flag_paid_exceeds_billed", pa.bool_()),
 ]
-OUTPUT_SCHEMA = pa.schema(OUTPUT_FIELDS)
 OUTPUT_COLUMNS = [n for n, _ in OUTPUT_FIELDS]
-
-# Reference columns the output needs (same as the Java codecs).
-MEMBER_COLS = ["member_id", "first_name", "last_name", "gender", "plan_type", "risk_score"]
-PROVIDER_COLS = ["provider_id", "provider_name", "specialty", "npi", "network_status"]
 
 GIB = 1 << 30
 
@@ -64,10 +62,12 @@ def peak_rss_gib():
 
 
 class Stats:
-    """Thread-safe counters with the same drop reasons as the Java job."""
+    """Thread-safe counters. Every claim row read ends up in exactly one of
+    written / malformed / no_claim_id / bad_key / member_not_found / provider_not_found /
+    duplicate_claim_id."""
 
     FIELDS = ("read", "written", "malformed", "no_claim_id", "bad_key", "member_not_found",
-              "provider_not_found", "loaded")
+              "provider_not_found", "duplicate_claim_id", "loaded")
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -79,12 +79,15 @@ class Stats:
             for k, v in kw.items():
                 setattr(self, k, getattr(self, k) + int(v))
 
+    def dropped(self):
+        return {f: getattr(self, f) for f in self.FIELDS[2:-1]}
+
 
 class Run:
     """Phase timers, a 30 s progress line and the final summary block."""
 
-    def __init__(self, tag, every=30.0):
-        self.tag, self.stats, self.phase = tag, Stats(), "starting"
+    def __init__(self, tag, every=30.0, quiet=False):
+        self.tag, self.stats, self.phase, self.quiet = tag, Stats(), "starting", quiet
         self.t0, self.wall0 = time.perf_counter(), time.time()
         self.times = {}
         self._stop = threading.Event()
@@ -92,7 +95,8 @@ class Run:
         threading.Thread(target=self._progress, daemon=True).start()
 
     def log(self, msg):
-        print(f"[{self.tag}] {msg}", flush=True)
+        if not self.quiet:
+            print(f"[{self.tag}] {msg}", flush=True)
 
     def _progress(self):
         while not self._stop.wait(self._every):
@@ -121,9 +125,10 @@ class Run:
         load = sum(v for k, v in self.times.items() if k.startswith("loading"))
         self.log(f"DONE read={s.read:,} written={s.written:,}  load={load:.1f} s  "
                  f"join+write={join:.1f} s  total={total:.1f} s")
-        self.log(f"dropped: malformed={s.malformed:,} no_claim_id={s.no_claim_id:,} "
-                 f"bad_member/provider_key={s.bad_key:,} member_not_found={s.member_not_found:,} "
-                 f"provider_not_found={s.provider_not_found:,}")
+        self.log("dropped: " + " ".join(f"{k}={v:,}" for k, v in s.dropped().items()))
+        accounted = s.written + sum(s.dropped().values())
+        if accounted != s.read:
+            self.log(f"WARNING: {s.read - accounted:,} rows read are not accounted for")
         if join and s.read:
             self.log(f"throughput: {s.read / join:,.0f} rows/s (join+write)")
         cpu = os.times()
