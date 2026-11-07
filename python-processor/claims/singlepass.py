@@ -42,7 +42,8 @@ from .common import (CLAIM_COLS, CLAIMS, GIB, MEMBERS, OUTPUT_FIELDS, PROVIDERS,
 BLOCK_SIZE = 16 << 20          # decompressed CSV bytes per Arrow batch (~150K rows)
 ROW_GROUP_ROWS = 1_000_000     # output rows buffered per Parquet row group
 FILE_ROWS = 4_000_000          # output rows per Parquet file (~200 MB): small enough to rewrite
-CSV_THREADS = True             # let Arrow parse each claims part with its own threads too
+CSV_THREADS = False            # one thread per part is enough; Arrow's own CSV threads add
+                               # read-ahead memory (join footprint 14 -> 13 GB) and were not faster
 PART_CAPACITY = 1 << 25        # max rows per reference part (33.5M; parts here are 25M)
 NULL_CODE = -1
 RISK_NULL = 0xFFFF
