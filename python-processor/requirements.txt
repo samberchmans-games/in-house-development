@@ -1,0 +1,7 @@
+# the job
+pyarrow==26.0.1
+numpy==2.5.4
+psutil==7.2.2
+# verification and tests only (reference SQL oracle, output comparison)
+duckdb==2.0.0
+pytest==9.2.0
